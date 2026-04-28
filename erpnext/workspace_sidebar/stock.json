@@ -625,10 +625,12 @@
    "type": "Link"
   }
  ],
- "modified": "2026-01-02 18:10:31.153427",
+ "modified": "2026-02-20 16:45:15.295668",
  "modified_by": "Administrator",
  "module": "Stock",
+ "module_onboarding": "Stock Onboarding",
  "name": "Stock",
  "owner": "Administrator",
+ "standard": 1,
  "title": "Stock"
 }

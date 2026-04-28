@@ -18,6 +18,7 @@ frappe.ui.form.on("Sales Order", {
 			Project: "Project",
 			"Payment Entry": "Payment",
 			"Work Order": "Work Order",
+			"Production Plan": "Production Plan",
 		};
 		frm.add_fetch("customer", "tax_id", "tax_id");
 
@@ -26,7 +27,7 @@ frappe.ui.form.on("Sales Order", {
 			let color;
 			if (!doc.qty && frm.doc.has_unit_price_items) {
 				color = "yellow";
-			} else if (doc.stock_qty <= doc.delivered_qty) {
+			} else if (doc.stock_qty <= doc.actual_qty) {
 				color = "green";
 			} else {
 				color = "orange";
@@ -55,6 +56,20 @@ frappe.ui.form.on("Sales Order", {
 
 		frm.set_df_property("packed_items", "cannot_add_rows", true);
 		frm.set_df_property("packed_items", "cannot_delete_rows", true);
+	},
+	delivery_date(frm) {
+		if (frm.doc.delivery_date) {
+			frm.doc.items.forEach((d) => {
+				frappe.model.set_value(d.doctype, d.name, "delivery_date", frm.doc.delivery_date);
+			});
+		}
+	},
+	transaction_date(frm) {
+		prevent_past_delivery_dates(frm);
+		frm.set_value("delivery_date", "");
+		frm.doc.items.forEach((d) => {
+			frappe.model.set_value(d.doctype, d.name, "delivery_date", "");
+		});
 	},
 
 	refresh: function (frm) {
@@ -158,7 +173,7 @@ frappe.ui.form.on("Sales Order", {
 				});
 			}
 		}
-
+		prevent_past_delivery_dates(frm);
 		// Hide `Reserve Stock` field description in submitted or cancelled Sales Order.
 		if (frm.doc.docstatus > 0) {
 			frm.set_df_property("reserve_stock", "description", null);
@@ -236,13 +251,6 @@ frappe.ui.form.on("Sales Order", {
 			"Unreconcile Payment Entries",
 			"Delivery Schedule Item",
 		];
-	},
-
-	delivery_date: function (frm) {
-		$.each(frm.doc.items || [], function (i, d) {
-			if (!d.delivery_date) d.delivery_date = frm.doc.delivery_date;
-		});
-		refresh_field("items");
 	},
 
 	create_stock_reservation_entries(frm) {
@@ -708,29 +716,32 @@ frappe.ui.form.on("Sales Order", {
 		if (!frequency) {
 			frappe.throw(__("Please select a frequency for delivery schedule"));
 		}
-
 		if (!first_delivery_date) {
 			frappe.throw(__("Please enter the first delivery date"));
 		}
-
 		if (no_of_deliveries <= 0) {
 			frappe.throw(__("Please enter a valid number of deliveries"));
 		}
 
+		const month_mapper = {
+			Monthly: 1,
+			Quarterly: 3,
+			"Half Yearly": 6,
+			Yearly: 12,
+		};
+
 		frm.schedule_dialog.fields_dict.delivery_schedule.df.data = [];
 		let qty_to_deliver = row.qty;
 		let qty_per_delivery = qty_to_deliver / no_of_deliveries;
-		for (let i = 0; i < no_of_deliveries; i++) {
-			let qty = qty_per_delivery;
-			if (must_be_whole_number) {
-				qty = cint(qty);
-			}
 
-			if (i === no_of_deliveries - 1) {
-				// Last delivery, adjust the quantity to deliver the remaining amount
+		for (let i = 0; i < no_of_deliveries; i++) {
+			let qty;
+			const is_last = i === no_of_deliveries - 1;
+
+			if (is_last) {
 				qty = qty_to_deliver;
-				qty_to_deliver = 0;
 			} else {
+				qty = must_be_whole_number ? cint(qty_per_delivery) : qty_per_delivery;
 				qty_to_deliver -= qty;
 			}
 
@@ -739,20 +750,15 @@ frappe.ui.form.on("Sales Order", {
 				qty: qty,
 			});
 
-			if (frequency === "Weekly") {
-				first_delivery_date = frappe.datetime.add_days(first_delivery_date, i + 1 * 7);
-			} else {
-				let month_mapper = {
-					Monthly: 1,
-					Quarterly: 3,
-					Half_Yearly: 6,
-					Yearly: 12,
-				};
-
-				first_delivery_date = frappe.datetime.add_months(
-					first_delivery_date,
-					month_mapper[frequency] * i + 1
-				);
+			if (!is_last) {
+				if (frequency === "Weekly") {
+					first_delivery_date = frappe.datetime.add_days(first_delivery_date, 7);
+				} else {
+					first_delivery_date = frappe.datetime.add_months(
+						first_delivery_date,
+						month_mapper[frequency]
+					);
+				}
 			}
 		}
 
@@ -1052,6 +1058,14 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 								__("Create")
 							);
 						}
+
+						if (frappe.model.can_create("Production Plan") && !doc.is_subcontracted) {
+							this.frm.add_custom_button(
+								__("Production Plan"),
+								() => this.make_production_plan(),
+								__("Create")
+							);
+						}
 					}
 
 					// sales invoice
@@ -1150,7 +1164,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 				if (flt(doc.per_billed) < 100 + frappe.boot.sysdefaults.over_billing_allowance) {
 					this.frm.add_custom_button(
 						__("Payment Request"),
-						() => this.make_payment_request(),
+						() => this.make_payment_request_with_schedule(),
 						__("Create")
 					);
 
@@ -1220,10 +1234,12 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 			},
 			freeze: true,
 			callback: function (r) {
-				if (!r.message) {
+				if (r.message.length === 0) {
 					frappe.msgprint({
 						title: __("Work Order not created"),
-						message: __("No Items with Bill of Materials to Manufacture"),
+						message: __(
+							"No Items with Bill of Materials to Manufacture or all items already manufactured"
+						),
 						indicator: "orange",
 					});
 					return;
@@ -1233,19 +1249,24 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 							label: __("Items"),
 							fieldtype: "Table",
 							fieldname: "items",
+							cannot_add_rows: true,
 							description: __("Select BOM and Qty for Production"),
 							fields: [
 								{
-									fieldtype: "Read Only",
+									fieldtype: "Link",
 									fieldname: "item_code",
+									options: "Item",
 									label: __("Item Code"),
 									in_list_view: 1,
+									read_only: 1,
 								},
 								{
-									fieldtype: "Read Only",
+									fieldtype: "Data",
 									fieldname: "item_name",
 									label: __("Item Name"),
 									in_list_view: 1,
+									read_only: 1,
+									fetch_from: "item_code.item_name",
 								},
 								{
 									fieldtype: "Link",
@@ -1271,6 +1292,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 									reqd: 1,
 									label: __("Sales Order Item"),
 									hidden: 1,
+									read_only: 1,
 								},
 							],
 							data: r.message,
@@ -1324,6 +1346,13 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 		});
 	}
 
+	make_production_plan() {
+		frappe.model.open_mapped_doc({
+			method: "erpnext.selling.doctype.sales_order.sales_order.make_production_plan",
+			frm: this.frm,
+		});
+	}
+
 	order_type() {
 		this.toggle_delivery_date();
 	}
@@ -1374,6 +1403,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 
 	make_raw_material_request_dialog(r) {
 		var me = this;
+		r.message.forEach((item) => (item.__checked = 1));
 		var fields = [
 			{ fieldtype: "Check", fieldname: "include_exploded_items", label: __("Include Exploded Items") },
 			{
@@ -1384,7 +1414,8 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 			{
 				fieldtype: "Table",
 				fieldname: "items",
-				description: __("Select BOM, Qty and For Warehouse"),
+				description: __("Finished Goods"),
+				cannot_delete_rows: true,
 				fields: [
 					{
 						fieldtype: "Read Only",
@@ -1808,3 +1839,11 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 };
 
 extend_cscript(cur_frm.cscript, new erpnext.selling.SalesOrderController({ frm: cur_frm }));
+
+function prevent_past_delivery_dates(frm) {
+	if (frm.doc.transaction_date) {
+		frm.fields_dict["delivery_date"].datepicker?.update({
+			minDate: new Date(frm.doc.transaction_date),
+		});
+	}
+}

@@ -6,7 +6,7 @@ import json
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from functools import reduce
+from functools import cache, reduce
 from typing import Any, Union
 
 import frappe
@@ -15,7 +15,8 @@ from frappe.database.operator_map import OPERATOR_MAP
 from frappe.query_builder import Case
 from frappe.query_builder.functions import Sum
 from frappe.utils import cstr, date_diff, flt, getdate
-from pypika.terms import LiteralValue
+from frappe.utils.xlsxutils import XLSXMetadata, XLSXStyleBuilder
+from pypika.terms import Bracket, LiteralValue
 
 from erpnext import get_company_currency
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
@@ -37,6 +38,9 @@ from erpnext.accounts.report.financial_statements import (
 	get_period_list,
 )
 from erpnext.accounts.utils import get_children, get_currency_precision
+
+DEFAULT_BULLET_PREFIX = "• "
+SEGMENT_PREFIX = "seg_"
 
 # ============================================================================
 # DATA MODELS
@@ -141,7 +145,7 @@ class SegmentData:
 
 	@property
 	def id(self) -> str:
-		return f"seg_{self.index}"
+		return f"{SEGMENT_PREFIX}{self.index}"
 
 
 @dataclass
@@ -541,7 +545,7 @@ class FinancialQueryBuilder:
 			.where(acb_table.period_closing_voucher == closing_voucher)
 		)
 
-		query = self._apply_standard_filters(query, acb_table)
+		query = self._apply_standard_filters(query, acb_table, "Account Closing Balance")
 		results = self._execute_with_permissions(query, "Account Closing Balance")
 
 		for row in results:
@@ -636,12 +640,15 @@ class FinancialQueryBuilder:
 		return self._execute_with_permissions(query, "GL Entry")
 
 	def _calculate_running_balances(self, balances_data: dict, gl_data: list[dict]) -> dict:
-		for row in gl_data:
-			account = row["account"]
+		gl_dict = {row["account"]: row for row in gl_data}
+		accounts = set(balances_data.keys()) | set(gl_dict.keys())
+
+		for account in accounts:
 			if account not in balances_data:
 				balances_data[account] = AccountData(account=account, **self._get_account_meta(account))
 
 			account_data: AccountData = balances_data[account]
+			gl_movement = gl_dict.get(account, {})
 
 			if account_data.has_periods():
 				first_period = account_data.get_period(self.periods[0]["key"])
@@ -651,19 +658,12 @@ class FinancialQueryBuilder:
 
 			for period in self.periods:
 				period_key = period["key"]
-				movement = row.get(period_key, 0.0)
+				movement = gl_movement.get(period_key, 0.0)
 				closing_balance = current_balance + movement
 
 				account_data.add_period(PeriodValue(period_key, current_balance, closing_balance, movement))
 
 				current_balance = closing_balance
-
-		# Accounts with no movements
-		for account_data in balances_data.values():
-			for period in self.periods:
-				period_key = period["key"]
-				if period_key not in account_data.period_values:
-					account_data.add_period(PeriodValue(period_key, 0.0, 0.0, 0.0))
 
 	def _handle_balance_accumulation(self, balances_data):
 		for account_data in balances_data.values():
@@ -683,12 +683,12 @@ class FinancialQueryBuilder:
 			else:
 				account_data.unaccumulate_values()
 
-	def _apply_standard_filters(self, query, table):
+	def _apply_standard_filters(self, query, table, doctype: str = "GL Entry"):
 		if self.filters.get("ignore_closing_entries"):
-			if hasattr(table, "is_period_closing_voucher_entry"):
-				query = query.where(table.is_period_closing_voucher_entry == 0)
-			else:
+			if doctype == "GL Entry":
 				query = query.where(table.voucher_type != "Period Closing Voucher")
+			else:
+				query = query.where(table.is_period_closing_voucher_entry == 0)
 
 		if self.filters.get("project"):
 			projects = self.filters.get("project")
@@ -736,7 +736,7 @@ class FinancialQueryBuilder:
 		user_conditions = build_match_conditions(doctype)
 
 		if user_conditions:
-			query = query.where(LiteralValue(user_conditions))
+			query = query.where(Bracket(LiteralValue(user_conditions)))
 
 		return query.run(as_dict=True)
 
@@ -1396,7 +1396,8 @@ class FormattingEngine:
 				condition=lambda rd: getattr(rd.row, "italic_text", False), format_properties={"italic": True}
 			),
 			FormattingRule(
-				condition=lambda rd: rd.is_detail_row, format_properties={"is_detail": True, "prefix": "• "}
+				condition=lambda rd: rd.is_detail_row,
+				format_properties={"is_detail": True, "prefix": DEFAULT_BULLET_PREFIX},
 			),
 			FormattingRule(
 				condition=lambda rd: getattr(rd.row, "warn_if_negative", False),
@@ -1842,3 +1843,124 @@ class GrowthViewTransformer:
 			return 0.0
 		else:
 			return flt(((current_value - previous_value) / abs(previous_value)) * 100, 2)
+
+
+# ============================================================================
+# XLSX EXPORT STYLING
+# ============================================================================
+
+
+def get_xlsx_styles(metadata: XLSXMetadata) -> dict | None:
+	"""
+	Generate XLSX styles for financial report templates.
+
+	NOTE: Currently only custom report generated with "Report Template" filter will have styles applied.
+	"""
+	# skip styling
+	if not metadata.filters.get("report_template"):
+		return
+
+	builder = XLSXStyleBuilder(metadata, default_styling=False)
+	builder.apply_default_styles(currency_formatting=False)
+
+	# currency is fixed for all columns (only if report template filter is applied)
+	currency = get_company_currency(metadata.filters.get("company"))
+
+	styles = {
+		"bold": builder.register_style({"bold": True}),
+		"italic": builder.register_style({"italic": True}),
+		"warning": builder.register_style({"font_color": "#dc3545"}),  # text-danger
+	}
+
+	fieldtype_formats = {
+		"Int": builder.register_style({"num_format": "General"}),
+		"Float": builder.register_style({"num_format": builder.get_number_format("Float")}),
+		"Percent": builder.register_style({"num_format": builder.get_number_format("Percent")}),
+		"Currency": builder.register_style({"num_format": builder.get_number_format("Currency", currency)}),
+	}
+
+	# quick access for hot loop
+	style_cell = builder.style_cell
+
+	@cache
+	def get_color_style(color: str) -> int:
+		return builder.register_style({"font_color": color})
+
+	@cache
+	def get_prefix_style(prefix: str) -> int:
+		prefix = f"{prefix or DEFAULT_BULLET_PREFIX}@"
+
+		return builder.register_style({"num_format": prefix})
+
+	@cache
+	def get_indent_style(indent: int) -> int:
+		return builder.register_style({"align": "left", "indent": indent})
+
+	# column level styling of currency columns
+	for col_idx, col in metadata.column_map.items():
+		if col.get("fieldtype") != "Currency":
+			continue
+
+		builder.style_column(col_idx, fieldtype_formats["Currency"])
+
+	# cell level styling
+	for row_idx, row in metadata.row_map.items():
+		# skip total row
+		if metadata.has_total_row and row_idx == builder.last_row_index:
+			continue
+
+		is_segmented = (row.get("_segment_info", {}).get("total_segments", 1) or 1) > 1
+		segment_values = row.get("segment_values", {}) or {}
+
+		for col_idx, col in metadata.column_map.items():
+			fieldname = col.get("fieldname")
+			is_account = fieldname == "account"
+
+			# determine formatting bucket
+			if is_segmented and fieldname.startswith(SEGMENT_PREFIX):
+				formatting = row.copy()
+
+				_, seg_idx, seg_fieldname = fieldname.split("_", 2)
+				is_account = seg_fieldname == "account"
+				formatting.update(segment_values.get(f"{SEGMENT_PREFIX}{seg_idx}", {}) or {})
+			else:
+				formatting = row  # default formatting bucket.
+
+			if not is_account and formatting.get("is_blank_line"):
+				continue
+
+			col_fieldtype = col.get("fieldtype")
+			cell_fieldtype = formatting.get("fieldtype") or col_fieldtype
+			cell_value = row.get(fieldname)
+
+			if cell_value in (None, ""):
+				continue
+
+			# account column and other fieldtype styling
+			if is_account:
+				if formatting.get("is_detail") or (prefix := formatting.get("prefix")):
+					style_cell(row_idx, col_idx, get_prefix_style(prefix))
+
+				# custom indentation (different segment might have different indentation levels)
+				if is_segmented and (indent := formatting.get("indent")) and indent > 0:
+					style_cell(row_idx, col_idx, get_indent_style(indent))
+			else:
+				if col_fieldtype != cell_fieldtype and cell_fieldtype in fieldtype_formats:
+					style_cell(row_idx, col_idx, fieldtype_formats[cell_fieldtype])
+
+			# text styles
+			for style_key in ("bold", "italic"):
+				if formatting.get(style_key):
+					style_cell(row_idx, col_idx, styles[style_key])
+
+			# color styles
+			if (
+				formatting.get("warn_if_negative")
+				and cell_fieldtype in frappe.model.numeric_fieldtypes
+				and flt(cell_value) < 0
+			):
+				style_cell(row_idx, col_idx, styles["warning"])
+			elif color := formatting.get("color"):
+				style_cell(row_idx, col_idx, get_color_style(color))
+
+	return builder.result

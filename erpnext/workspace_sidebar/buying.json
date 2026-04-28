@@ -369,10 +369,12 @@
    "type": "Link"
   }
  ],
- "modified": "2026-01-02 12:10:07.304778",
+ "modified": "2026-02-20 15:19:47.010810",
  "modified_by": "Administrator",
  "module": "Buying",
+ "module_onboarding": "Buying Onboarding",
  "name": "Buying",
  "owner": "Administrator",
+ "standard": 1,
  "title": "Buying"
 }

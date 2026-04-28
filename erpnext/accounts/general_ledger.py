@@ -9,7 +9,6 @@ from frappe import _
 from frappe.model.meta import get_field_precision
 from frappe.utils import cint, flt, formatdate, get_link_to_form, getdate, now
 from frappe.utils.caching import request_cache
-from frappe.utils.dashboard import cache_source
 
 import erpnext
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
@@ -36,7 +35,8 @@ def make_gl_entries(
 ):
 	if gl_map:
 		if (
-			not cint(frappe.get_single_value("Accounts Settings", "use_legacy_budget_controller"))
+			not cancel
+			and not cint(frappe.get_single_value("Accounts Settings", "use_legacy_budget_controller"))
 			and gl_map[0].voucher_type != "Period Closing Voucher"
 		):
 			bud_val = BudgetValidation(gl_map=gl_map)
@@ -430,6 +430,8 @@ def make_entry(args, adv_adj, update_outstanding, from_repost=False):
 	gle.flags.adv_adj = adv_adj
 	gle.flags.update_outstanding = update_outstanding or "Yes"
 	gle.flags.notify_update = False
+	if gle.is_cancelled:
+		gle.flags.ignore_links = True
 	gle.submit()
 
 	if (

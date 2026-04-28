@@ -11,6 +11,7 @@ from frappe.contacts.address_and_contact import (
 	delete_contact_and_address,
 	load_address_and_contact,
 )
+from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
 from frappe.model.naming import set_name_by_naming_series, set_name_from_naming_options
 from frappe.model.utils.rename_doc import update_linked_doctypes
@@ -83,11 +84,10 @@ class Customer(TransactionBase):
 		opportunity_name: DF.Link | None
 		payment_terms: DF.Link | None
 		portal_users: DF.Table[PortalUser]
-		primary_address: DF.Text | None
+		primary_address: DF.TextEditor | None
 		prospect_name: DF.Link | None
 		represents_company: DF.Link | None
 		sales_team: DF.Table[SalesTeam]
-		salutation: DF.Link | None
 		so_required: DF.Check
 		supplier_numbers: DF.Table[SupplierNumberAtCustomer]
 		tax_category: DF.Link | None
@@ -117,13 +117,39 @@ class Customer(TransactionBase):
 			set_name_from_naming_options(frappe.get_meta(self.doctype).autoname, self)
 
 	def get_customer_name(self):
+		self.customer_name = self.customer_name.strip()
 		if frappe.db.get_value("Customer", self.customer_name) and not frappe.flags.in_import:
-			count = frappe.db.sql(
-				"""select ifnull(MAX(CAST(SUBSTRING_INDEX(name, ' ', -1) AS UNSIGNED)), 0) from tabCustomer
-				 where name like %s""",
-				f"%{self.customer_name} - %",
-				as_list=1,
-			)[0][0]
+			name_prefix = f"{self.customer_name} - %"
+
+			if frappe.db.db_type == "postgres":
+				# Postgres: extract trailing digits (e.g. "Customer - 3") and cast to int.
+				# NOTE: PostgreSQL is strict about types; MySQL's UNSIGNED cast does not exist.
+				count = frappe.db.sql(
+					"""
+					SELECT COALESCE(
+						MAX(CAST(SUBSTRING(name FROM '\\d+$') AS INTEGER)),
+						0
+					)
+					FROM tabCustomer
+					WHERE name LIKE %(name_prefix)s
+					""",
+					{"name_prefix": name_prefix},
+					as_list=1,
+				)[0][0]
+			else:
+				# MariaDB/MySQL: keep existing behavior.
+				count = frappe.db.sql(
+					"""
+					SELECT COALESCE(
+						MAX(CAST(SUBSTRING_INDEX(name, ' ', -1) AS UNSIGNED)),
+						0
+					)
+					FROM tabCustomer
+					WHERE name LIKE %(name_prefix)s
+					""",
+					{"name_prefix": name_prefix},
+					as_list=1,
+				)[0][0]
 			count = cint(count) + 1
 
 			new_customer_name = f"{self.customer_name} - {cstr(count)}"
@@ -148,6 +174,7 @@ class Customer(TransactionBase):
 	def validate(self):
 		self.flags.is_new_doc = self.is_new()
 		self.flags.old_lead = self.lead_name
+		self.validate_customer_group()
 		validate_party_accounts(self)
 		self.validate_credit_limit_on_change()
 		self.set_loyalty_program()
@@ -331,6 +358,17 @@ class Customer(TransactionBase):
 				frappe.NameError,
 			)
 
+	def validate_customer_group(self):
+		if not self.customer_group:
+			return
+
+		is_group = frappe.db.get_value("Customer Group", self.customer_group, "is_group")
+		if is_group:
+			frappe.throw(
+				_("Cannot select a Group type Customer Group. Please select a non-group Customer Group."),
+				title=_("Invalid Customer Group"),
+			)
+
 	def validate_credit_limit_on_change(self):
 		if self.get("__islocal") or not self.credit_limits:
 			return
@@ -406,7 +444,7 @@ class Customer(TransactionBase):
 
 
 @frappe.whitelist()
-def make_quotation(source_name, target_doc=None):
+def make_quotation(source_name: str, target_doc: str | Document | None = None):
 	def set_missing_values(source, target):
 		_set_missing_values(source, target)
 
@@ -435,7 +473,7 @@ def make_quotation(source_name, target_doc=None):
 
 
 @frappe.whitelist()
-def make_opportunity(source_name, target_doc=None):
+def make_opportunity(source_name: str, target_doc: str | Document | None = None):
 	def set_missing_values(source, target):
 		_set_missing_values(source, target)
 
@@ -459,7 +497,7 @@ def make_opportunity(source_name, target_doc=None):
 
 
 @frappe.whitelist()
-def make_payment_entry(source_name, target_doc=None):
+def make_payment_entry(source_name: str, target_doc: str | Document | None = None):
 	def set_missing_values(source, target):
 		_set_missing_values(source, target)
 
@@ -511,10 +549,13 @@ def _set_missing_values(source, target):
 
 	if contact:
 		target.contact_person = contact[0].parent
+		target.contact_display, target.contact_email, target.contact_mobile = frappe.get_value(
+			"Contact", contact[0].parent, ["full_name", "email_id", "mobile_no"]
+		)
 
 
 @frappe.whitelist()
-def get_loyalty_programs(doc):
+def get_loyalty_programs(doc: Document):
 	"""returns applicable loyalty programs for a customer"""
 
 	lp_details = []
@@ -616,7 +657,9 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 
 
 @frappe.whitelist()
-def send_emails(customer, customer_outstanding, credit_limit, credit_controller_users_list):
+def send_emails(
+	customer: str, customer_outstanding: float, credit_limit: float, credit_controller_users_list: str | list
+):
 	if isinstance(credit_controller_users_list, str):
 		credit_controller_users_list = json.loads(credit_controller_users_list)
 	subject = _("Credit limit reached for customer {0}").format(customer)
@@ -824,7 +867,7 @@ def make_address(args, is_primary_address=1, is_shipping_address=1):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def get_customer_primary(doctype, txt, searchfield, start, page_len, filters):
+def get_customer_primary(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	customer = filters.get("customer")
 	type = filters.get("type")
 	type_doctype = qb.DocType(type)

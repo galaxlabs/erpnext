@@ -1,7 +1,6 @@
 # Copyright (c) 2017, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-
 import frappe
 from email_reply_parser import EmailReplyParser
 from frappe import _, qb
@@ -9,7 +8,7 @@ from frappe.desk.reportview import get_match_cond
 from frappe.model.document import Document
 from frappe.query_builder import Interval
 from frappe.query_builder.functions import Count, CurDate, Date, Sum, UnixTimestamp
-from frappe.utils import add_days, flt, get_datetime, get_link_to_form, get_time, get_url, nowtime, today
+from frappe.utils import add_days, flt, get_datetime, get_link_to_form, get_time, nowtime, today
 from frappe.utils.user import is_website_user
 
 from erpnext import get_default_company
@@ -308,6 +307,8 @@ class Project(Document):
 		self.gross_margin = flt(self.total_billed_amount) - expense_amount
 		if self.total_billed_amount:
 			self.per_gross_margin = (self.gross_margin / flt(self.total_billed_amount)) * 100
+		else:
+			self.per_gross_margin = 0
 
 	def update_purchase_costing(self):
 		total_purchase_cost = calculate_total_purchase_cost(self.name)
@@ -454,7 +455,7 @@ def get_list_context(context=None):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def get_users_for_project(doctype, txt, searchfield, start, page_len, filters):
+def get_users_for_project(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	conditions = []
 	return frappe.db.sql(
 		"""select name, concat_ws(' ', first_name, middle_name, last_name)
@@ -481,7 +482,7 @@ def get_users_for_project(doctype, txt, searchfield, start, page_len, filters):
 
 
 @frappe.whitelist()
-def get_cost_center_name(project):
+def get_cost_center_name(project: str):
 	return frappe.db.get_value("Project", project, "cost_center")
 
 
@@ -551,7 +552,7 @@ def allow_to_make_project_update(project, time, frequency):
 
 
 @frappe.whitelist()
-def create_duplicate_project(prev_doc, project_name):
+def create_duplicate_project(prev_doc: str, project_name: str):
 	"""Create duplicate project based on the old project"""
 	import json
 
@@ -603,7 +604,7 @@ def send_project_update_email_to_users(project):
 			"sent": 0,
 			"date": today(),
 			"time": nowtime(),
-			"naming_series": "UPDATE-.project.-.YY.MM.DD.-",
+			"naming_series": "UPDATE-.project.-.YY.MM.DD.-.####",
 		}
 	).insert()
 
@@ -691,7 +692,7 @@ def update_project_sales_billing():
 
 
 @frappe.whitelist()
-def create_kanban_board_if_not_exists(project):
+def create_kanban_board_if_not_exists(project: str):
 	from frappe.desk.doctype.kanban_board.kanban_board import quick_kanban_board
 
 	project = frappe.get_doc("Project", project)
@@ -702,7 +703,7 @@ def create_kanban_board_if_not_exists(project):
 
 
 @frappe.whitelist()
-def set_project_status(project, status):
+def set_project_status(project: str, status: str):
 	"""
 	set status for project and all related tasks
 	"""
@@ -719,7 +720,7 @@ def set_project_status(project, status):
 	project.save()
 
 
-def get_holiday_list(company=None):
+def get_holiday_list(company: str | None = None) -> str:
 	if not company:
 		company = get_default_company() or frappe.get_all("Company")[0].name
 
